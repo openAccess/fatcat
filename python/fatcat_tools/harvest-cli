@@ -1,0 +1,262 @@
+#!/usr/bin/env python
+"""
+Usage:
+    harvest-cli  SRC-ID ... [options]
+
+Options:
+    -h                    This help screen
+    --kafka-broker=<kn>   Kafka broker - "host1:port1,..."  [default: {kbroker}]
+    --from=<%Y-%m-%d>     From date %Y-%m-%d                [default: {fday}]
+    --until=<%Y-%m-%d>    Until date %Y-%m-%d               [default: {uday}]
+    --topic-suffix=<ts>   Topic suffix string  ex: fatcat-oaipmh-<src-id>-<ts>  [default: qa]
+    --stdout              Direct output to standard out
+    --log                 Start start logging.
+    --log-suffix=<ls>     Suffix for fatcat log  fatcat-log-<ls>.log. [default: {tday}]
+    --log-level=<lvl>     Log level <INFO|WARN|ERROR|DEBUG> [default: ERROR]
+
+Description:
+
+harverst-cli  src-id ...
+
+Collects works information from the sources listed. One or more source ids can
+be specified and the data will be collected concurrently for the given date
+range.
+
+SouRCe-IDentifiers:
+       (src-id)    (endpoint url)
+{srcInfo}
+       all      -  all of the above
+
+"""
+import os, sys, logging
+from concurrent.futures import ThreadPoolExecutor, wait
+
+from harvest import Harvester, src_oai_id, SRC_IDS
+from docopt import docopt
+from datetime import date, timedelta, datetime
+from confluent_kafka import Producer
+
+_DEFAULT_TOPIC = 'fatcat-oaipmh-{src}-{ts}'
+_DEFAULT_STATE_TOPIC = 'fatcat-oaipmh-{src}-state-{ts}'
+_DATE_FORMAT = '%Y-%m-%d'
+
+_LOGGER = None
+_STD_OUT = False
+_LOGGING = False
+
+_KCONFIG = {
+    'bootstrap.servers': 'localhost:9092',
+    'default.topic.config': {'request.required.acks': 1},
+
+}
+
+# Default parameters for each  harvester
+# TODO: The data for this dict could also come from a yaml config file
+_OAI_SRC_DATA = {
+    'arxiv': {
+        'endpoint_url': 'https://export.arxiv.org/oai2',
+        'metadata_prefix': 'arXivRaw',
+        'contact_email': None,
+    },
+    'doajA': {
+        'endpoint_url': 'https://www.doaj.org/oai.article',
+        'metadata_prefix': 'oai_doa',
+        'contact_email': None,
+    },
+    'doajJ': {
+        'endpoint_url': 'https://www.doaj.org/oai',
+        'metadata_prefix': 'oai_dc',
+        'contact_email': None,
+    },
+    'pubmed': {
+        'endpoint_url': 'https://www.ncbi.nlm.nih.gov/pmc/oai/oai.cgi',
+        'metadata_prefix': 'pmc_fm',
+        'contact_email': None,
+    },
+    'crossref': {
+        'endpoint_url': 'https://api.crossref.org/works',
+        'metadata_prefix': None,
+        'contact_email': 'dumpster@mailinator.com',
+    },
+    'datacite': {
+        'endpoint_url': 'https://api.datacite.org/works',
+        'metadata_prefix': None,
+        'contact_email': 'dumpster@mailinator.com',
+    },
+}
+
+
+def mkdate(raw):
+    return datetime.strptime(raw, "%Y-%m-%d").date()
+
+
+def yesterday():
+    """
+    Calculate and return a date object for yesterday.
+    :return: date
+    """
+    yday = date.today() - timedelta(1)
+    return yday.strftime(_DATE_FORMAT)
+
+
+def day_range(from_day, until_day):
+    """
+    Generate a list of days given a date range.
+
+    :param from_day: date   - from or starting day
+    :param until_day: date  - until or final day
+    :return: generator
+    """
+    for i in range((until_day - from_day).days + 1):
+        yield from_day + timedelta(i)
+
+
+def topic(suffix, src_id):
+    """
+    Formats a kafka topic given a source id and a suffix.
+    The suffix can be specified on the command line.
+    :param suffix:
+    :param src_id:
+    :return:
+    """
+    return _DEFAULT_TOPIC.format(ts=suffix, src=src_id)
+
+
+def state_topic(suffix, src_id):
+    return _DEFAULT_STATE_TOPIC.format(ts=suffix, src=src_id)
+
+
+def delivery_callback(err, msg):
+    """
+    Log successful and failed Kafka writes.
+    :param err:
+    :param msg:
+    :return:
+    """
+    global _LOGGER
+    if err:
+        logging.error('Message failed delivery -{e}'.format(e=err))
+    else:
+        logging.info('Message delivered {k}'.format(k=str(msg.key())))
+
+
+def run_worker(producer, worker, src_id, day, topic):
+    """
+    Entry point to for each task. Harvesters gather records.
+    Each record is then transferred to Kafka:topic
+
+    :param producer:
+    :param worker:
+    :param src_id:
+    :param day:
+    :param topic:
+    :return:
+    """
+    global _STD_OUT
+
+    worker.endpoint_url = _OAI_SRC_DATA[src_id]['endpoint_url']
+    worker.metadata_prefix = _OAI_SRC_DATA[src_id]['metadata_prefix']
+    worker.contact_email = _OAI_SRC_DATA[src_id]['contact_email']
+
+    for hdr, rec in worker.fetch_recs_day(day):
+        if _STD_OUT:
+            print('{}\n'.format(str(worker.to_string(rec))))
+            logging.info('"{id}" processed.'.format(id=hdr.decode("utf-8")))
+            continue
+
+        try:
+            # Produce line (without newline)
+            producer.produce(topic, rec, hdr, callback=delivery_callback)
+        except BufferError:
+            logging.info('Local producer queue is full - {d} messages awaiting delivery.'.format(d=str(len(producer))))
+
+        # Poll allows the delivery callback to execute
+        producer.poll(0)
+
+
+def oai_harvest(producer, src_ids, days, topic_suffix, to_stdout):
+    """
+    Assign a thread for each day and each src-id. Total scheduled task will
+    be #days X #src-ids. Thread Pool size equal to the number of src-ids therefore
+    there will only be #src-ids threads running concurrently.
+
+    :param producer:      - Producer object
+    :param src_ids:       - list or generator of src-ids
+    :param days:          - list or generator of days
+    :param topic_suffix:  - str to identify/differentiate topics
+    :param to_stdout:     - send output to stadard out instead of Kafka
+    :return:
+    """
+    global _STD_OUT
+    _STD_OUT = to_stdout
+
+    num_wkr = len(SRC_IDS)
+    with ThreadPoolExecutor(max_workers=num_wkr) as executor:
+        futures = []
+        # Loop through the day range.
+        for day in days:
+            # Submit a worker for execution - a worker for each src-id
+            # for the given day.
+            for src_id in src_ids:
+                wkr = Harvester(src_id)
+                futures.append(executor.submit(run_worker, producer, wkr, src_id, day, topic(topic_suffix, src_id)))
+
+        # Wait until of the submitted workers have completed
+        wait(futures)
+        # Kafka client should be sync but flush as sanity check
+        producer.flush()
+
+
+def producer_config(args):
+    _KCONFIG['bootstrap.servers'] = args['--kafka-broker']
+    return _KCONFIG
+
+
+def logger_config(args):
+    global _LOGGER
+    _FORMAT = '%(levelname)-8s %(asctime)-15s %(message)s'
+
+    log_file = 'fatcat-log-{ls}.log'.format(ls=args['--log-suffix'])
+    logging.basicConfig(filename=log_file, format=_FORMAT, level=logging.INFO)
+
+def format_sorcInfo():
+    info_str = '       {id:9}- {url}\n'
+    rstr = ''
+    for k, v in _OAI_SRC_DATA.items():
+        rstr += info_str.format(id=k, url=v['endpoint_url'])
+    return rstr
+
+
+def main(args):
+    """
+    Parse the arguement parameters and start the harvester.
+
+    :param args:
+    :return:
+    """
+
+    ts = args['--topic-suffix']
+    to_stdout = args['--stdout']
+    f_day = mkdate(args['--from'])
+    u_day = mkdate(args['--until'])
+
+    # Sanity check - is until day <= today?
+    # If > today then set today as upper limit
+    u_day = u_day if u_day <= date.today() else date.today()
+    assert (f_day <= u_day)
+
+    if args['--log']:
+        logger_config(args)
+    p = Producer(producer_config(args))
+    oai_harvest(p, src_oai_id(args['SRC-ID']), day_range(f_day, u_day), ts, to_stdout)
+
+
+if __name__ == '__main__':
+    today = date.today().strftime(_DATE_FORMAT)
+    _doc = __doc__.format(kbroker=_KCONFIG['bootstrap.servers'],
+                          srcInfo=format_sorcInfo(),
+                          fday=yesterday(),
+                          uday=today,
+                          tday=today)
+    args = docopt(_doc, version='harvest-cli 0.1')
+    main(args)
